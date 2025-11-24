@@ -1,4 +1,3 @@
-// src/btree_node.rs
 use std::convert::TryInto;
 use std::fs::{OpenOptions, File};
 use std::io::{Seek, SeekFrom, Read, Write};
@@ -18,8 +17,8 @@ pub struct RecordPointer {
 pub struct BTreeNode {
     pub is_leaf: bool,
     pub keys: Vec<String>,
-    pub values: Vec<RecordPointer>, // only used for leaf nodes
-    pub children: Vec<u64>,         // page ids, only used for internal nodes
+    pub values: Vec<RecordPointer>,
+    pub children: Vec<u64>,         
 }
 
 impl BTreeNode {
@@ -36,7 +35,7 @@ impl BTreeNode {
         BTreeNode {
             is_leaf: false,
             keys: Vec::new(),
-            values: Vec::new(), // unused for internal nodes
+            values: Vec::new(), 
             children: Vec::new(),
         }
     }
@@ -49,9 +48,6 @@ pub struct BTree {
 }
 
 impl BTree {
-    // -----------------------
-    // open/create index file
-    // -----------------------
     pub fn open(path: &Path) -> Self {
         let mut file = OpenOptions::new()
             .read(true).write(true).create(true)
@@ -62,7 +58,6 @@ impl BTree {
         let file_len = metadata.len();
 
         let (root_page, next_page) = if file_len == 0 {
-            // brand new file: write header page
             let mut header = vec![0u8; PAGE_SIZE];
             header[0..8].copy_from_slice(&0u64.to_le_bytes()); // root_page = 0
             header[8..16].copy_from_slice(&1u64.to_le_bytes()); // next_page = 1
@@ -71,15 +66,13 @@ impl BTree {
             file.sync_all().unwrap();
             (0u64, 1u64)
         } else {
-            // read header
             let mut header = [0u8; PAGE_SIZE];
             file.seek(SeekFrom::Start(0)).unwrap();
             file.read_exact(&mut header).unwrap();
             let root = u64::from_le_bytes(header[0..8].try_into().unwrap());
             let next = u64::from_le_bytes(header[8..16].try_into().unwrap());
 
-            // reconcile next_page with actual file length to avoid EOF reads
-            let actual_pages = if file_len == 0 { 0 } else { (file_len / PAGE_SIZE as u64) };
+            let actual_pages = if file_len == 0 { 0 } else { file_len / PAGE_SIZE as u64 };
             let reconciled_next = if actual_pages == 0 { 1 } else { actual_pages };
             let next_page_final = if next > reconciled_next { reconciled_next } else { next };
 
@@ -89,9 +82,6 @@ impl BTree {
         BTree { index: file, root_page, next_page }
     }
 
-    // -----------------------
-    // low level page ops
-    // -----------------------
     pub fn alloc_page(&mut self) -> u64 {
         let new_page = self.next_page;
         let empty = [0u8; PAGE_SIZE];
@@ -112,10 +102,8 @@ impl BTree {
         let offset = page_id * PAGE_SIZE as u64;
         let mut buf = [0u8; PAGE_SIZE];
 
-        // auto-extend file if necessary to avoid UnexpectedEof in dev
         let file_len = self.index.metadata().unwrap().len();
         if file_len < offset + PAGE_SIZE as u64 {
-            // extend with zeros up to that page
             self.index.seek(SeekFrom::End(0)).unwrap();
             let mut remaining = (offset + PAGE_SIZE as u64).saturating_sub(file_len);
             let zeros = vec![0u8; PAGE_SIZE];
@@ -139,13 +127,7 @@ impl BTree {
         self.write_raw_page(0, &header);
     }
 
-    // -----------------------
-    // encode/decode nodes
-    // -----------------------
-    // Layout (per page):
-    // [1 byte is_leaf][2 bytes key_count][for each key: 2 bytes klen | klen bytes key | (if leaf -> 8 bytes offset + 4 bytes length)]
-    // If internal: after keys write (key_count+1) * 8 bytes children
-    pub fn write_node(&mut self, page_id: u64, node: &BTreeNode) {
+     pub fn write_node(&mut self, page_id: u64, node: &BTreeNode) {
         let mut buf = [0u8; PAGE_SIZE];
 
         buf[0] = if node.is_leaf { 1 } else { 0 };
@@ -164,7 +146,6 @@ impl BTree {
             pos += klen as usize;
 
             if node.is_leaf {
-                // value: offset (8) + length (4)
                 buf[pos..pos + 8].copy_from_slice(&node.values[i].offset.to_le_bytes());
                 pos += 8;
                 buf[pos..pos + 4].copy_from_slice(&node.values[i].length.to_le_bytes());
@@ -173,7 +154,6 @@ impl BTree {
         }
 
         if !node.is_leaf {
-            // children (key_count + 1)
             for child in &node.children {
                 buf[pos..pos + 8].copy_from_slice(&child.to_le_bytes());
                 pos += 8;
@@ -223,11 +203,7 @@ impl BTree {
         BTreeNode { is_leaf, keys, values, children }
     }
 
-    // -----------------------
-    // splitting + insertion
-    // -----------------------
 
-    /// split child at parent.children[index]
     pub fn split_child(&mut self, parent_page: u64, index: usize) {
         let t = ORDER;
 
@@ -239,15 +215,12 @@ impl BTree {
             return;
         }
 
-        // new page z
         let z_page = self.alloc_page();
         let mut z = if y.is_leaf { BTreeNode::new_leaf() } else { BTreeNode::new_internal() };
 
-        // middle key
         let middle_key = y.keys[t - 1].clone();
 
         if y.is_leaf {
-            // split leaf: keys[0..t-1] | middle | keys[t..]
             z.keys = y.keys.split_off(t);
             z.values = y.values.split_off(t);
 
@@ -262,18 +235,14 @@ impl BTree {
             y.children.truncate(t);
         }
 
-        // insert z_page after child_page
         parent.children.insert(index + 1, z_page);
-        // insert middle key into parent.keys
         parent.keys.insert(index, middle_key);
 
-        // write back changes
         self.write_node(child_page, &y);
         self.write_node(z_page, &z);
         self.write_node(parent_page, &parent);
     }
 
-    /// insert into non-full node at page_id
     pub fn insert_nonfull(&mut self, page_id: u64, key: String, ptr: RecordPointer) {
         let mut node = self.read_node(page_id);
 
@@ -288,7 +257,6 @@ impl BTree {
             return;
         }
 
-        // internal node: find child index
         let mut idx = match node.keys.binary_search(&key) {
             Ok(i) => i + 1,
             Err(i) => i,
@@ -299,9 +267,7 @@ impl BTree {
 
         if child.keys.len() == MAX_KEYS {
             self.split_child(page_id, idx);
-            // reload parent
             node = self.read_node(page_id);
-            // decide which child to go to
             if key > node.keys[idx] {
                 idx += 1;
             }
@@ -321,23 +287,20 @@ impl BTree {
             self.write_node(page, &leaf);
             self.root_page = page;
             self.update_header();
-            return;
+           return;
         }
-
+ 
         let root = self.read_node(self.root_page);
 
         if root.keys.len() == MAX_KEYS {
-            // create new root
             let new_root_page = self.alloc_page();
             let mut new_root = BTreeNode::new_internal();
             new_root.children.push(self.root_page);
             self.write_node(new_root_page, &new_root);
 
-            // set as root
             self.root_page = new_root_page;
             self.update_header();
 
-            // split child 0
             self.split_child(new_root_page, 0);
 
             // continue insert
@@ -365,8 +328,6 @@ impl BTree {
                 if node.is_leaf {
                     return Some(node.values[i]);
                 } else {
-                    // in our layout: internal nodes don't have values, so
-                    // when we find equal key in internal, pick child i+1 and descend
                     let child = node.children[i + 1];
                     return self.search_node(child, key);
                 }
@@ -383,66 +344,3 @@ impl BTree {
     }
 }
 
-impl BTree {
-
-    /// Print a summary of a single page on disk
-    pub fn debug_print_page(&mut self, page_id: u64) {
-        let node = self.read_node(page_id);
-
-        println!("-----------------------------------------------");
-        println!("PAGE ID: {}", page_id);
-        println!("TYPE   : {}", if node.is_leaf { "Leaf" } else { "Internal" });
-        println!("KEYS   : {}", node.keys.len());
-
-        if node.is_leaf {
-            for (i, k) in node.keys.iter().enumerate() {
-                println!("  [{}] KEY='{}', offset={}, length={}",
-                    i, k, node.values[i].offset, node.values[i].length);
-            }
-        } else {
-            for (i, k) in node.keys.iter().enumerate() {
-                println!("  [{}] KEY='{}'  CHILD_L={}, CHILD_R={}",
-                    i, k, node.children[i], node.children[i+1]);
-            }
-        }
-    }
-
-
-    /// Recursively print the full B-tree structure
-    pub fn debug_print_tree(&mut self) {
-        if self.root_page == 0 {
-            println!("Tree empty.");
-            return;
-        }
-
-        println!("\n======= B-TREE STRUCTURE (RECURSIVE) =======");
-        self.debug_print_node_recursive(self.root_page, 0);
-    }
-
-
-    fn debug_print_node_recursive(&mut self, page_id: u64, depth: usize) {
-        let node = self.read_node(page_id);
-        let indent = "  ".repeat(depth);
-
-        println!("{}PAGE {} [{}]", indent, page_id,
-            if node.is_leaf { "Leaf" } else { "Internal" });
-
-        println!("{}  Keys: {}", indent, node.keys.len());
-
-        for key in &node.keys {
-            println!("{}    • {}", indent, key);
-        }
-
-        if !node.is_leaf {
-            println!("{}  Children:", indent);
-            for child in &node.children {
-                println!("{}    -> {}", indent, child);
-            }
-
-            // Recurse
-            for child in node.children.clone() {
-                self.debug_print_node_recursive(child, depth + 1);
-            }
-        }
-    }
-}
