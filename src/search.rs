@@ -26,7 +26,6 @@ fn main() {
             break;
         }
 
-        // FIXED: correct syntax
         if let Some(ptr) = btree.search(&key) {
             println!("FOUND '{}' at offset={} length={}",
                 key, ptr.offset, ptr.length);

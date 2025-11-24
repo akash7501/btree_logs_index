@@ -6,6 +6,8 @@ use std::fs::{OpenOptions, create_dir_all, File};
 use std::io::{Write, Seek, SeekFrom, Read};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -21,7 +23,7 @@ fn main() {
     create_dir_all("logs").unwrap();
 
     // Open or create the index file
-    let path = Path::new("index.db");
+    let path = Path::new("index.data");
     let mut btree = BTree::open(path);
 
     println!("Opened index.db");
@@ -36,7 +38,7 @@ fn main() {
         .open("logs/app.log")
         .unwrap();
 
-    for i in 0..11 {
+    for i in 0..2000 {
         // Current file offset (this is the pointer!)
         let offset = log_file.seek(SeekFrom::Current(0)).unwrap();
 
@@ -67,13 +69,9 @@ fn main() {
 
         // Insert into B-tree
         btree.insert(msg_key.clone(), ptr);
-    }
+            println!("\nFinished writing logs.\n");
 
-    println!("\nFinished writing logs.\n");
-
-    // ------------------------------------------------
-    // SEARCH for a log and read its actual content
-    // ------------------------------------------------
+ 
     let search_key = "Unique log message #27";
 
     if let Some(ptr) = btree.search(search_key) {
@@ -85,16 +83,8 @@ fn main() {
     } else {
         println!("Not found: {}", search_key);
     }
-    println!("\n========= PAGE-WISE VISUALIZATION =========");
-for page in 1..btree.next_page {
-    btree.debug_print_page(page);
 }
-
-println!("\n========= FULL TREE STRUCTURE =========");
-btree.debug_print_tree();
-
 }
-
 // Read log from logs/app.log using the pointer
 pub fn read_log_entry(ptr: RecordPointer) -> String {
     let mut file = File::open("logs/app.log").unwrap();
