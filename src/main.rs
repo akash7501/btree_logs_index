@@ -8,6 +8,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::thread;
 use std::time;
+use btree_node::{DISK_READS, DISK_WRITES};
+use std::sync::atomic::Ordering;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -69,21 +71,12 @@ fn main() {
 
         // Insert into B-tree
         btree.insert(msg_key.clone(), ptr);
-            println!("\nFinished writing logs.\n");
-
- 
-    let search_key = "Unique log message #27";
-
-    if let Some(ptr) = btree.search(search_key) {
-        println!("FOUND '{}' at offset={} length={}",
-            search_key, ptr.offset, ptr.length);
-
-        let actual = read_log_entry(ptr);
-        println!("\nActual log line:\n{}", actual);
-    } else {
-        println!("Not found: {}", search_key);
-    }
 }
+println!("================ Disk Access Summary ================");
+println!("Disk Reads  : {}", DISK_READS.load(Ordering::Relaxed));
+println!("Disk Writes : {}", DISK_WRITES.load(Ordering::Relaxed));
+println!("=====================================================");
+
 }
 // Read log from logs/app.log using the pointer
 pub fn read_log_entry(ptr: RecordPointer) -> String {

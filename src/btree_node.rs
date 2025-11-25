@@ -2,6 +2,10 @@ use std::convert::TryInto;
 use std::fs::{OpenOptions, File};
 use std::io::{Seek, SeekFrom, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub static DISK_READS: AtomicU64 = AtomicU64::new(0);
+pub static DISK_WRITES: AtomicU64 = AtomicU64::new(0);
 
 pub const PAGE_SIZE: usize = 4096;
 pub const ORDER: usize =4;
@@ -92,6 +96,7 @@ impl BTree {
     }
 
     fn write_raw_page(&mut self, page_id: u64, buf: &[u8; PAGE_SIZE]) {
+        DISK_READS.fetch_add(1, Ordering::Relaxed);
         let offset = page_id * PAGE_SIZE as u64;
         self.index.seek(SeekFrom::Start(offset)).unwrap();
         self.index.write_all(buf).unwrap();
@@ -99,6 +104,7 @@ impl BTree {
     }
 
     fn read_raw_page(&mut self, page_id: u64) -> [u8; PAGE_SIZE] {
+         DISK_WRITES.fetch_add(1, Ordering::Relaxed);
         let offset = page_id * PAGE_SIZE as u64;
         let mut buf = [0u8; PAGE_SIZE];
 
