@@ -6,10 +6,11 @@ use std::fs::{OpenOptions, create_dir_all, File};
 use std::io::{Write, Seek, SeekFrom, Read};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::thread;
-use std::time;
+use btree_node::{DISK_READS, DISK_WRITES};
+use std::sync::atomic::Ordering;
 
-const PAGE_SIZE: u64 = 4096;
+
+const LOG_PATH: &str = "logs/app.log";
 
 #[derive(Serialize)]
 struct LogEntry {
@@ -19,34 +20,35 @@ struct LogEntry {
 }
 
 fn main() {
-    // Ensure logs folder exists
+    // Ensure logs directory exists
     create_dir_all("logs").unwrap();
 
-    // Open or create the index file
+    // Open or create B-Tree index file
     let path = Path::new("index.data");
     let mut btree = BTree::open(path);
 
-    println!("Opened index.db");
+    println!("Opened index.data");
     println!("root_page = {}", btree.root_page);
     println!("next_page = {}", btree.next_page);
     println!("----------------------------------");
 
-    // Single log file
+    // Open or create the log file
     let mut log_file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("logs/app.log")
+        .open(LOG_PATH)
         .unwrap();
 
+    // Insert 2000 log entries
     for i in 0..2000 {
-        // Current file offset (this is the pointer!)
+        // Current write offset -> pointer for B-tree
         let offset = log_file.seek(SeekFrom::Current(0)).unwrap();
 
-        // Create log string
         let msg_key = format!("Unique log message #{}", i);
 
         let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH).unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
             .as_millis();
 
         let entry = LogEntry {
@@ -57,21 +59,25 @@ fn main() {
 
         let json_line = serde_json::to_string(&entry).unwrap() + "\n";
 
-        // Write log to file
+        // Write the actual log line
         log_file.write_all(json_line.as_bytes()).unwrap();
         log_file.flush().unwrap();
 
-        // Build pointer for B-tree
+        // Build B-tree pointer
         let ptr = RecordPointer {
             offset,
             length: json_line.len() as u32,
         };
 
-        // Insert into B-tree
+        // Insert into B-tree index
         btree.insert(msg_key.clone(), ptr);
-            println!("\nFinished writing logs.\n");
+    }
 
- 
+    println!("\nFinished writing logs.\n");
+
+    // -------------------------------
+    // Test a search
+    // -------------------------------
     let search_key = "Unique log message #27";
 
     if let Some(ptr) = btree.search(search_key) {
@@ -83,11 +89,22 @@ fn main() {
     } else {
         println!("Not found: {}", search_key);
     }
+
+    // Flush B-Tree pages to disk
+    btree.flush();
+     let reads = DISK_READS.load(Ordering::Relaxed);
+    let writes = DISK_WRITES.load(Ordering::Relaxed);
+
+    println!("----------------------------------");
+    println!("Disk Access Summary");
+    println!("Disk Reads  : {}", reads);
+    println!("Disk Writes : {}", writes);
+    println!("----------------------------------");
 }
-}
-// Read log from logs/app.log using the pointer
+
+// Read log entry from log file using RecordPointer
 pub fn read_log_entry(ptr: RecordPointer) -> String {
-    let mut file = File::open("logs/app.log").unwrap();
+    let mut file = File::open(LOG_PATH).unwrap();
 
     file.seek(SeekFrom::Start(ptr.offset)).unwrap();
 

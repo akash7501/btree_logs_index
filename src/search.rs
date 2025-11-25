@@ -8,7 +8,7 @@ use std::io::{self, Write, Read, Seek, SeekFrom};
 use std::path::Path;
 
 fn main() {
-    let mut btree = BTree::open(Path::new("index.db"));
+    let mut btree = BTree::open(Path::new("index.data"));
 
     println!("Search Agent started.");
     println!("Type a key to search, or 'exit' to quit.\n");

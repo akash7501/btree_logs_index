@@ -1,11 +1,16 @@
 use std::convert::TryInto;
-use std::fs::{OpenOptions, File};
-use std::io::{Seek, SeekFrom, Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use lru::LruCache;
 
-pub const PAGE_SIZE: usize = 4096;
-pub const ORDER: usize =4;
+pub const PAGE_SIZE: usize = 8192;
+pub const ORDER: usize = 100;
 pub const MAX_KEYS: usize = 2 * ORDER - 1;
+pub static DISK_READS: AtomicU64 = AtomicU64::new(0);
+pub static DISK_WRITES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
 pub struct RecordPointer {
@@ -18,7 +23,7 @@ pub struct BTreeNode {
     pub is_leaf: bool,
     pub keys: Vec<String>,
     pub values: Vec<RecordPointer>,
-    pub children: Vec<u64>,         
+    pub children: Vec<u64>,
 }
 
 impl BTreeNode {
@@ -35,89 +40,271 @@ impl BTreeNode {
         BTreeNode {
             is_leaf: false,
             keys: Vec::new(),
-            values: Vec::new(), 
+            values: Vec::new(),
             children: Vec::new(),
         }
     }
 }
 
+/// Buffer frame: in-memory representation of a page (raw bytes).
+#[derive(Clone)]
+pub struct BufferFrame {
+    pub page_id: u64,
+    pub data: Vec<u8>, // RAW PAGE BYTES (PAGE_SIZE)
+    pub is_dirty: bool,
+    pub pin_count: usize,
+}
+
+impl BufferFrame {
+    pub fn new(page_id: u64, data: Vec<u8>) -> Self {
+        BufferFrame {
+            page_id,
+            data,
+            is_dirty: false,
+            pin_count: 0,
+        }
+    }
+}
+
+/// LRU-backed buffer pool (page cache).
+pub struct BufferPool {
+    pub cache: LruCache<u64, BufferFrame>,
+    pub file: File,
+}
+
+impl BufferPool {
+    pub fn open_file<P: AsRef<Path>>(path: P, capacity: usize) -> std::io::Result<Self> {
+        let cap_nz = NonZeroUsize::new(capacity)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "capacity must be > 0"))?;
+        let file = File::options().read(true).write(true).create(true).open(path)?;
+        Ok(Self {
+            cache: LruCache::new(cap_nz),
+            file,
+        })
+    }
+
+    /// Read a page from disk and return bytes (zero-filled for beyond-file pages).
+    fn read_page_from_disk(&mut self, page_id: u64) -> std::io::Result<Vec<u8>> {
+        DISK_READS.fetch_add(1, Ordering::Relaxed);
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let offset = page_id
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "page offset overflow"))?;
+
+        let file_len = self.file.metadata()?.len();
+        if file_len < offset + PAGE_SIZE as u64 {
+            if file_len > offset {
+                self.file.seek(SeekFrom::Start(offset))?;
+                let to_read = (file_len - offset) as usize;
+                self.file.read_exact(&mut buf[..to_read])?;
+            }
+            return Ok(buf);
+        }
+
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Write page bytes to disk (overwrite).
+    fn write_page_to_disk(&mut self, page_id: u64, data: &[u8]) -> std::io::Result<()> {
+         DISK_WRITES.fetch_add(1, Ordering::Relaxed);
+        debug_assert_eq!(data.len(), PAGE_SIZE);
+        let offset = page_id
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "page offset overflow"))?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)?;
+        Ok(())
+    }
+
+    /// Pin the page: ensure page is resident and increment pin_count.
+    /// DOES NOT return a reference. Use frame_mut() to access the pinned frame.
+    pub fn pin_page(&mut self, page_id: u64) -> std::io::Result<()> {
+        // Fast path: already resident
+        if let Some(frame) = self.cache.get_mut(&page_id) {
+            frame.pin_count = frame.pin_count.saturating_add(1);
+            return Ok(());
+        }
+
+        // Load page bytes from disk (needs &mut self)
+        let buf = self.read_page_from_disk(page_id)?;
+
+        // If the cache is full, evict one (may call write_page_to_disk)
+        if self.cache.len() >= self.cache.cap().get() {
+            self.evict_one()?;
+        }
+
+        // Insert and pin
+        self.cache.put(page_id, BufferFrame::new(page_id, buf));
+        if let Some(frame) = self.cache.get_mut(&page_id) {
+            frame.pin_count = 1;
+        }
+        Ok(())
+    }
+
+    /// Unpin the page: decrement pin_count (never negative).
+    pub fn unpin_page(&mut self, page_id: u64) {
+        if let Some(frame) = self.cache.get_mut(&page_id) {
+            if frame.pin_count > 0 {
+                frame.pin_count -= 1;
+            }
+        }
+    }
+
+    /// Access a mutable reference to the frame. Caller must ensure the page is pinned.
+    /// Returns `None` if the page is not resident.
+    pub fn frame_mut(&mut self, page_id: u64) -> Option<&mut BufferFrame> {
+        self.cache.get_mut(&page_id)
+    }
+
+    /// Mark resident frame dirty.
+    pub fn mark_dirty(&mut self, page_id: u64) {
+        if let Some(f) = self.cache.get_mut(&page_id) {
+            f.is_dirty = true;
+        }
+    }
+
+    /// Evict one unpinned LRU frame; write back if dirty.
+    fn evict_one(&mut self) -> std::io::Result<()> {
+        let capacity = self.cache.cap().get();
+        for _ in 0..capacity.saturating_add(1) {
+            if let Some((pid, frame)) = self.cache.pop_lru() {
+                if frame.pin_count == 0 {
+                    if frame.is_dirty {
+                        self.write_page_to_disk(pid, &frame.data)?;
+                    }
+                    return Ok(());
+                } else {
+                    // reinstate pinned frame as MRU
+                    self.cache.put(pid, frame);
+                }
+            } else {
+                break;
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "no evictable page (all pages pinned)",
+        ))
+    }
+
+    /// Read a page into an owned fixed-size array (pin/unpin internally).
+    pub fn read_page_copy(&mut self, page_id: u64) -> std::io::Result<[u8; PAGE_SIZE]> {
+        self.pin_page(page_id)?;
+        let arr = {
+            let frame = self.frame_mut(page_id).expect("frame should be present after pin");
+            let mut a = [0u8; PAGE_SIZE];
+            a.copy_from_slice(&frame.data);
+            a
+        };
+        self.unpin_page(page_id);
+        Ok(arr)
+    }
+
+    /// Write full page buffer into the pool (pin/unpin internally).
+    pub fn write_page(&mut self, page_id: u64, buf: &[u8; PAGE_SIZE]) -> std::io::Result<()> {
+        self.pin_page(page_id)?;
+        {
+            let frame = self.frame_mut(page_id).expect("frame should be present after pin");
+            frame.data.copy_from_slice(buf);
+            frame.is_dirty = true;
+        }
+        self.unpin_page(page_id);
+        Ok(())
+    }
+
+    /// Flush dirty pages to disk (does not fsync).
+    pub fn flush_all(&mut self) -> std::io::Result<()> {
+        // collect keys first to avoid double-borrow
+        let keys: Vec<u64> = self.cache.iter().map(|(k, _)| *k).collect();
+        for pid in keys {
+            if let Some(frame) = self.cache.get_mut(&pid) {
+    if frame.is_dirty {
+        // Step 1: copy needed data
+        let data = frame.data.clone();
+        // Step 2: mark clean inside cache
+        frame.is_dirty = false;
+        // Step 3: release &mut frame (borrow ends here)
+        drop(frame);
+
+        // Step 4: now safe to borrow &mut self again for disk write
+        self.write_page_to_disk(pid, &data)?;
+    }
+}
+
+        }
+        Ok(())
+    }
+
+    /// Force fsync of the underlying file
+    pub fn sync_all(&mut self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+/// The BTree structure using BufferPool
 pub struct BTree {
-    pub index: File,
+    pub pool: BufferPool,
     pub root_page: u64,
     pub next_page: u64,
 }
 
 impl BTree {
+    /// Open BTree with default cache capacity
     pub fn open(path: &Path) -> Self {
-        let mut file = OpenOptions::new()
-            .read(true).write(true).create(true)
-            .open(path)
-            .unwrap();
+        Self::open_with_capacity(path, 1024).expect("open btree")
+    }
 
-        let metadata = file.metadata().unwrap();
-        let file_len = metadata.len();
+    pub fn open_with_capacity(path: &Path, capacity: usize) -> std::io::Result<Self> {
+        let mut pool = BufferPool::open_file(path, capacity)?;
 
-        let (root_page, next_page) = if file_len == 0 {
-            let mut header = vec![0u8; PAGE_SIZE];
-            header[0..8].copy_from_slice(&0u64.to_le_bytes()); // root_page = 0
-            header[8..16].copy_from_slice(&1u64.to_le_bytes()); // next_page = 1
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.write_all(&header).unwrap();
-            file.sync_all().unwrap();
+        // Read header (page 0). If file empty, read_page_from_disk will return zeros.
+        let header = pool.read_page_copy(0)?;
+        let root = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        let next = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let file_len = pool.file.metadata()?.len();
+        let actual_pages = if file_len == 0 { 0 } else { file_len / PAGE_SIZE as u64 };
+        let reconciled_next = if actual_pages == 0 { 1 } else { actual_pages };
+        let next_page_final = if next == 0 { 1 } else { std::cmp::min(next, reconciled_next) };
+
+        let (root_page, next_page) = if file_len == 0 || (root == 0 && next == 0 && actual_pages == 0) {
+            let mut header_buf = [0u8; PAGE_SIZE];
+            header_buf[0..8].copy_from_slice(&0u64.to_le_bytes());
+            header_buf[8..16].copy_from_slice(&1u64.to_le_bytes());
+            pool.write_page(0, &header_buf)?;
+            pool.sync_all()?;
             (0u64, 1u64)
         } else {
-            let mut header = [0u8; PAGE_SIZE];
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.read_exact(&mut header).unwrap();
-            let root = u64::from_le_bytes(header[0..8].try_into().unwrap());
-            let next = u64::from_le_bytes(header[8..16].try_into().unwrap());
-
-            let actual_pages = if file_len == 0 { 0 } else { file_len / PAGE_SIZE as u64 };
-            let reconciled_next = if actual_pages == 0 { 1 } else { actual_pages };
-            let next_page_final = if next > reconciled_next { reconciled_next } else { next };
-
             (root, next_page_final)
         };
 
-        BTree { index: file, root_page, next_page }
+        Ok(BTree {
+            pool,
+            root_page,
+            next_page,
+        })
     }
 
     pub fn alloc_page(&mut self) -> u64 {
         let new_page = self.next_page;
-        let empty = [0u8; PAGE_SIZE];
-        self.write_raw_page(new_page, &empty);
+        let zero = [0u8; PAGE_SIZE];
+        self.pool.write_page(new_page, &zero).expect("alloc write");
         self.next_page += 1;
         self.update_header();
         new_page
     }
 
     fn write_raw_page(&mut self, page_id: u64, buf: &[u8; PAGE_SIZE]) {
-        let offset = page_id * PAGE_SIZE as u64;
-        self.index.seek(SeekFrom::Start(offset)).unwrap();
-        self.index.write_all(buf).unwrap();
-        self.index.flush().unwrap();
+        self.pool
+            .write_page(page_id, buf)
+            .expect("write_raw_page failed");
     }
 
     fn read_raw_page(&mut self, page_id: u64) -> [u8; PAGE_SIZE] {
-        let offset = page_id * PAGE_SIZE as u64;
-        let mut buf = [0u8; PAGE_SIZE];
-
-        let file_len = self.index.metadata().unwrap().len();
-        if file_len < offset + PAGE_SIZE as u64 {
-            self.index.seek(SeekFrom::End(0)).unwrap();
-            let mut remaining = (offset + PAGE_SIZE as u64).saturating_sub(file_len);
-            let zeros = vec![0u8; PAGE_SIZE];
-            while remaining > 0 {
-                let write_len = std::cmp::min(remaining, PAGE_SIZE as u64) as usize;
-                self.index.write_all(&zeros[..write_len]).unwrap();
-                remaining -= write_len as u64;
-            }
-            self.index.flush().unwrap();
-        }
-
-        self.index.seek(SeekFrom::Start(offset)).unwrap();
-        self.index.read_exact(&mut buf).unwrap();
-        buf
+        self.pool
+            .read_page_copy(page_id)
+            .expect("read_raw_page failed")
     }
 
     fn update_header(&mut self) {
@@ -127,7 +314,7 @@ impl BTree {
         self.write_raw_page(0, &header);
     }
 
-     pub fn write_node(&mut self, page_id: u64, node: &BTreeNode) {
+    pub fn write_node(&mut self, page_id: u64, node: &BTreeNode) {
         let mut buf = [0u8; PAGE_SIZE];
 
         buf[0] = if node.is_leaf { 1 } else { 0 };
@@ -203,7 +390,6 @@ impl BTree {
         BTreeNode { is_leaf, keys, values, children }
     }
 
-
     pub fn split_child(&mut self, parent_page: u64, index: usize) {
         let t = ORDER;
 
@@ -227,9 +413,7 @@ impl BTree {
             y.keys.truncate(t - 1);
             y.values.truncate(t - 1);
         } else {
-            // split internal: keys[0..t-1] | middle | keys[t..]
             z.keys = y.keys.split_off(t);
-            // children split
             z.children = y.children.split_off(t);
             y.keys.truncate(t - 1);
             y.children.truncate(t);
@@ -277,7 +461,6 @@ impl BTree {
         self.insert_nonfull(next_child, key, ptr);
     }
 
-    /// top-level insert
     pub fn insert(&mut self, key: String, ptr: RecordPointer) {
         if self.root_page == 0 {
             let page = self.alloc_page();
@@ -287,9 +470,9 @@ impl BTree {
             self.write_node(page, &leaf);
             self.root_page = page;
             self.update_header();
-           return;
+            return;
         }
- 
+
         let root = self.read_node(self.root_page);
 
         if root.keys.len() == MAX_KEYS {
@@ -303,16 +486,13 @@ impl BTree {
 
             self.split_child(new_root_page, 0);
 
-            // continue insert
             self.insert_nonfull(new_root_page, key, ptr);
         } else {
             self.insert_nonfull(self.root_page, key, ptr);
         }
     }
 
-    // -----------------------
-    // search
-    // -----------------------
+    /// search
     pub fn search(&mut self, key: &str) -> Option<RecordPointer> {
         if self.root_page == 0 {
             return None;
@@ -342,5 +522,10 @@ impl BTree {
             }
         }
     }
-}
 
+    /// Ensure all dirty pages are flushed to disk (and sync file).
+    pub fn flush(&mut self) {
+        self.pool.flush_all().expect("flush_all failed");
+        self.pool.sync_all().expect("sync failed");
+    }
+}
