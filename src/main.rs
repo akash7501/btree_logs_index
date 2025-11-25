@@ -1,115 +1,70 @@
+mod k8s_logs;
+mod tailer;
 mod btree_node;
 
-use crate::btree_node::{BTree, RecordPointer};
-use serde::Serialize;
-use std::fs::{OpenOptions, create_dir_all, File};
-use std::io::{Write, Seek, SeekFrom, Read};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-use btree_node::{DISK_READS, DISK_WRITES};
-use std::sync::atomic::Ordering;
+use notify::{Watcher, RecommendedWatcher, RecursiveMode, Event, EventKind};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
 
+fn main() -> notify::Result<()> {
+    println!("Starting Rust log-agent...");
 
-const LOG_PATH: &str = "logs/app.log";
+    // -----------------------------------------
+    // 1. Open your B-Tree index
+    // -----------------------------------------
+    let mut btree = btree_node::BTree::open(Path::new("/data/index.data"));
 
-#[derive(Serialize)]
-struct LogEntry {
-    ts: u128,
-    level: String,
-    msg: String,
-}
+    // -----------------------------------------
+    // 2. Create tailer
+    // -----------------------------------------
+    let mut tailer = tailer::LogTailer::new();
 
-fn main() {
-    // Ensure logs directory exists
-    create_dir_all("logs").unwrap();
-
-    // Open or create B-Tree index file
-    let path = Path::new("index.data");
-    let mut btree = BTree::open(path);
-
-    println!("Opened index.data");
-    println!("root_page = {}", btree.root_page);
-    println!("next_page = {}", btree.next_page);
-    println!("----------------------------------");
-
-    // Open or create the log file
-    let mut log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(LOG_PATH)
-        .unwrap();
-
-    // Insert 2000 log entries
-    for i in 0..2000 {
-        // Current write offset -> pointer for B-tree
-        let offset = log_file.seek(SeekFrom::Current(0)).unwrap();
-
-        let msg_key = format!("Unique log message #{}", i);
-
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        let entry = LogEntry {
-            ts,
-            level: "INFO".to_string(),
-            msg: msg_key.clone(),
-        };
-
-        let json_line = serde_json::to_string(&entry).unwrap() + "\n";
-
-        // Write the actual log line
-        log_file.write_all(json_line.as_bytes()).unwrap();
-        log_file.flush().unwrap();
-
-        // Build B-tree pointer
-        let ptr = RecordPointer {
-            offset,
-            length: json_line.len() as u32,
-        };
-
-        // Insert into B-tree index
-        btree.insert(msg_key.clone(), ptr);
+    // -----------------------------------------
+    // 3. Tail existing logs once (optional)
+    // -----------------------------------------
+    for path in k8s_logs::discover_ls_logs() {
+        tailer.tail_file(&path, &mut btree);
     }
 
-    println!("\nFinished writing logs.\n");
+    // -----------------------------------------
+    // 4. Setup filesystem watcher
+    // -----------------------------------------
+    let (tx, rx) = channel();
+    let mut watcher: RecommendedWatcher = notify::recommended_watcher(
+        move |res| {
+            if let Ok(event) = res {
+                tx.send(event).unwrap();
+            }
+        }
+    )?;
 
-    // -------------------------------
-    // Test a search
-    // -------------------------------
-    let search_key = "Unique log message #27";
+    watcher.watch(Path::new("/host/var/log/pods"), RecursiveMode::Recursive)?;
 
-    if let Some(ptr) = btree.search(search_key) {
-        println!("FOUND '{}' at offset={} length={}",
-            search_key, ptr.offset, ptr.length);
+    println!("Watching for log updates...");
 
-        let actual = read_log_entry(ptr);
-        println!("\nActual log line:\n{}", actual);
-    } else {
-        println!("Not found: {}", search_key);
+    // -----------------------------------------
+    // 5. Main loop — process events
+    // -----------------------------------------
+    loop {
+        if let Ok(event) = rx.recv() {
+            if let EventKind::Modify(_) = event.kind {
+                for p in event.paths {
+                    let path: PathBuf = p.into();
+
+                    // Only log files
+                    if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                        continue;
+                    }
+
+                    // Only namespace "ls_"
+                    if !path.to_string_lossy().contains("/ls_") {
+                        continue;
+                    }
+
+                    // Index new log lines
+                    tailer.tail_file(&path, &mut btree);
+                }
+            }
+        }
     }
-
-    // Flush B-Tree pages to disk
-    btree.flush();
-     let reads = DISK_READS.load(Ordering::Relaxed);
-    let writes = DISK_WRITES.load(Ordering::Relaxed);
-
-    println!("----------------------------------");
-    println!("Disk Access Summary");
-    println!("Disk Reads  : {}", reads);
-    println!("Disk Writes : {}", writes);
-    println!("----------------------------------");
-}
-
-// Read log entry from log file using RecordPointer
-pub fn read_log_entry(ptr: RecordPointer) -> String {
-    let mut file = File::open(LOG_PATH).unwrap();
-
-    file.seek(SeekFrom::Start(ptr.offset)).unwrap();
-
-    let mut buf = vec![0u8; ptr.length as usize];
-    file.read_exact(&mut buf).unwrap();
-
-    String::from_utf8(buf).unwrap()
 }

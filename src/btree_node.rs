@@ -46,11 +46,10 @@ impl BTreeNode {
     }
 }
 
-/// Buffer frame: in-memory representation of a page (raw bytes).
 #[derive(Clone)]
 pub struct BufferFrame {
     pub page_id: u64,
-    pub data: Vec<u8>, // RAW PAGE BYTES (PAGE_SIZE)
+    pub data: Vec<u8>, 
     pub is_dirty: bool,
     pub pin_count: usize,
 }
@@ -66,7 +65,6 @@ impl BufferFrame {
     }
 }
 
-/// LRU-backed buffer pool (page cache).
 pub struct BufferPool {
     pub cache: LruCache<u64, BufferFrame>,
     pub file: File,
@@ -523,7 +521,6 @@ impl BTree {
         }
     }
 
-    /// Ensure all dirty pages are flushed to disk (and sync file).
     pub fn flush(&mut self) {
         self.pool.flush_all().expect("flush_all failed");
         self.pool.sync_all().expect("sync failed");
